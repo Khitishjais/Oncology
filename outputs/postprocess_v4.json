@@ -1,0 +1,13 @@
+{
+ "encoder": "resnet50",
+ "n_folds": 5,
+ "threshold": 0.5,
+ "min_area": 100,
+ "fold_files": [
+  "fold0_model.pth",
+  "fold1_model.pth",
+  "fold2_model.pth",
+  "fold3_model.pth",
+  "fold4_model.pth"
+ ]
+}

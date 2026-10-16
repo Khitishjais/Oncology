@@ -1,0 +1,15 @@
+# environments / caches
+.venv/
+.venv312/
+__pycache__/
+*.pyc
+
+# data and large artifacts (too big for GitHub; model weights >100 MB each)
+data/
+outputs/*.npz
+outputs/*.pth
+deploy/hf_space/
+
+# logs
+*.log
+server.*.log

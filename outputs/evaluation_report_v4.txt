@@ -1,0 +1,5 @@
+Test slices: 561 (224 with tumor) | model: 5-fold ensemble (resnet50), TTA on, threshold=0.5, min_area=100
+5-fold CV (out-of-fold, 93 patients)  Dice(all)=0.8493  Dice(tumor)=0.7896 +/- 0.0451
+All slices      Dice=0.8881  IoU=0.8542   (empty-vs-empty scored 1.0)
+Tumor slices    Dice=0.7867  IoU=0.7018   <- the honest segmentation quality
+Pixel accuracy  99.547%   (misleading on its own)

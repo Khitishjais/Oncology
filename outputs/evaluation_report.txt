@@ -1,0 +1,4 @@
+Test slices: 561 (224 with tumor)
+All slices      Dice=0.0358  IoU=0.0192
+Tumor slices    Dice=0.0896  IoU=0.0481
+(empty-vs-empty slices scored as 1.0 in 'All slices')
