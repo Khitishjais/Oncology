@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "https://YOUR-HF-USERNAME-tumorvision.hf.space/$1" }
+    { "source": "/(.*)", "destination": "https://khitishprasad-tumorvision.hf.space/$1" }
   ]
 }

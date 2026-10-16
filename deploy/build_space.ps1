@@ -11,7 +11,8 @@ foreach ($p in $Patients) {
   if (-not (Test-Path "$root\data\$p")) { Write-Warning "missing patient $p"; continue }
   Copy-Item "$root\data\$p" "$out\data\$p" -Recurse
 }
-Copy-Item "$PSScriptRoot\Dockerfile", "$PSScriptRoot\requirements.txt" $out
+Copy-Item "$PSScriptRoot\requirements.txt" $out
+Copy-Item "$PSScriptRoot\space_app.py" "$out\app.py"
 Copy-Item "$PSScriptRoot\SPACE_README.md" "$out\README.md"
 Set-Content "$out\.gitattributes" "*.pth filter=lfs diff=lfs merge=lfs -text`n*.tif filter=lfs diff=lfs merge=lfs -text"
 "{0:N0} MB in {1}" -f ((Get-ChildItem $out -Recurse -File | Measure Length -Sum).Sum/1MB), $out
