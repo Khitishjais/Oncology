@@ -1,4 +1,8 @@
 {
+  "framework": null,
+  "buildCommand": "",
+  "installCommand": "",
+  "outputDirectory": "public",
   "rewrites": [
     { "source": "/(.*)", "destination": "https://khitishprasad-tumorvision.hf.space/$1" }
   ]
