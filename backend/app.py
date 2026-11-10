@@ -10,7 +10,7 @@ Run:
     (run this from D:\\oncology, so "backend" is importable as a package)
 
 Then open http://127.0.0.1:8000 in a browser for the demo page,
-or http://127.0.0.1:8000/docs for the interactive API docs.
+(public API docs are disabled).
 """
 import base64
 import io
@@ -30,7 +30,8 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 from common import OUT, build_model, to_tensor  # noqa: E402
 
-app = FastAPI(title="TumorVision API", description="Brain MRI tumor segmentation (LGG dataset, 5-fold U-Net ensemble)")
+app = FastAPI(title="TumorVision API", description="Brain MRI tumor segmentation (LGG dataset, 5-fold U-Net ensemble)",
+              docs_url=None, redoc_url=None, openapi_url=None)   # no public API docs; the UI is the product
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 MODELS = []       # loaded once at startup
@@ -190,6 +191,90 @@ def volume_stats(mask: np.ndarray) -> dict:
     return stats
 
 
+def describe_tumor(mask: np.ndarray, slice_indices: list) -> dict:
+    """Facts about the segmented tumor that a radiologist's findings paragraph would cite: which slices,
+    where in the image, largest cross-section, and how many disconnected regions (6-connected in 3D).
+    Left/right/upper/lower are as DISPLAYED - the dataset carries no orientation metadata."""
+    D, H, W = mask.shape
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return {"present": False}
+    remaining = set(map(tuple, coords.tolist()))
+    sizes = []
+    steps = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    while remaining:
+        stack = [remaining.pop()]
+        n = 1
+        while stack:
+            z, y, x = stack.pop()
+            for dz, dy, dx in steps:
+                nb = (z + dz, y + dy, x + dx)
+                if nb in remaining:
+                    remaining.remove(nb)
+                    stack.append(nb)
+                    n += 1
+        sizes.append(n)
+    sizes.sort(reverse=True)
+    areas = mask.reshape(D, -1).sum(1)
+    tumor_slices = np.nonzero(areas)[0]
+    cz, cy, cx = coords.mean(0)
+    horiz = "left" if cx < W / 3 else "right" if cx > 2 * W / 3 else "central"
+    vert = "upper" if cy < H / 3 else "lower" if cy > 2 * H / 3 else "mid"
+    location = "central region" if (horiz == "central" and vert == "mid") else \
+        (f"{vert} part" if horiz == "central" else f"{horiz} side" if vert == "mid" else f"{vert}-{horiz} part")
+    big = int(np.argmax(areas))
+    return {
+        "present": True,
+        "n_regions": len(sizes),
+        "largest_region_percent": round(100 * sizes[0] / sum(sizes), 1),
+        "location": location,
+        "first_slice": slice_indices[int(tumor_slices[0])],
+        "last_slice": slice_indices[int(tumor_slices[-1])],
+        "largest_slice": slice_indices[big],
+        "largest_slice_pixels": int(areas[big]),
+    }
+
+
+def draft_report(stats: dict, desc: dict) -> dict:
+    """AI-drafted report sections, built only from the measurements above (no free-text generation, so
+    nothing is stated that the segmentation did not produce). The radiologist edits and signs it."""
+    D = stats["total_slices"]
+    technique = (
+        f"Automated segmentation of a {D}-slice brain MRI stack (3 channels per slice) using a "
+        f"{len(MODELS)}-fold U-Net ({CFG.get('encoder')}) ensemble with flip test-time augmentation. "
+        "Pixel spacing and slice thickness are not available; measurements are given in pixels and slice counts."
+    )
+    if not desc["present"]:
+        return {
+            "technique": technique,
+            "findings": f"No tumor region was segmented on any of the {D} slices.",
+            "impression": "No tumor identified by automated segmentation. Radiologist review of the source images is required.",
+        }
+    ex = stats["extent"]
+    k = stats["slices_with_tumor"]
+    findings = (
+        f"An abnormal region segmented as tumor is identified on {k} of {D} slices (slice indices "
+        f"{desc['first_slice']} to {desc['last_slice']}), occupying {stats['tumor_volume_percent_of_scanned_stack']}% "
+        f"of the scanned stack ({stats['tumor_voxel_count']:,} voxels). It lies mainly in the {desc['location']} "
+        f"of the image as displayed. Maximal in-plane extent is approximately {ex['width_px']} x {ex['height_px']} "
+        f"pixels over a depth of {ex['depth_slices']} slices. The largest cross-section is on slice "
+        f"{desc['largest_slice']} ({desc['largest_slice_pixels']:,} pixels). "
+    )
+    if desc["n_regions"] == 1:
+        findings += "The segmentation forms a single contiguous region."
+    else:
+        findings += (
+            f"The segmentation forms {desc['n_regions']} separate regions; the largest accounts for "
+            f"{desc['largest_region_percent']}% of the segmented volume. Smaller separate regions may represent "
+            "additional foci or segmentation artefact and need review."
+        )
+    impression = (
+        f"AI-segmented tumor region in the {desc['location']} of the image, spanning {k} slice(s). "
+        "Findings require radiologist verification; clinical correlation advised."
+    )
+    return {"technique": technique, "findings": findings, "impression": impression}
+
+
 def tumor_pointcloud(mask: np.ndarray, max_points: int = 15000) -> list:
     """Downsampled (z,y,x) voxel coordinates of the tumor, for the 3D scatter view."""
     zs, ys, xs = np.nonzero(mask)
@@ -236,9 +321,11 @@ def analyze_patient(pid: str) -> dict:
         points = tumor_pointcloud(mask)
         if len(_ANALYSIS_CACHE) >= _ANALYSIS_CACHE_MAX:
             _ANALYSIS_CACHE.pop(next(iter(_ANALYSIS_CACHE)))
+        stats = volume_stats(mask)
         _ANALYSIS_CACHE[pid] = {
             "shape": {"depth_slices": mask.shape[0], "height_px": mask.shape[1], "width_px": mask.shape[2]},
-            "stats": volume_stats(mask),
+            "stats": stats,
+            "draft": draft_report(stats, describe_tumor(mask, slice_indices)),
             "points": points,
             "tumor_voxels": int(mask.sum()),
             "reps": representative_slices(scan_stack, mask, slice_indices),
@@ -310,6 +397,7 @@ def dataset_patient_volume(pid: str):
         "shape": a["shape"],
         "stats": a["stats"],
         "calibration": CALIBRATION_NOTE,
+        "draft": a["draft"],
         "pointcloud": a["points"],
         "pointcloud_downsampled_from": a["tumor_voxels"] if len(a["points"]) < a["tumor_voxels"] else None,
         "representative_slices": a["reps"],
@@ -618,7 +706,6 @@ footer .disclaimer svg{width:15px;height:15px;color:var(--danger);flex:none}
     <div class="nav-right">
       <span class="health"><span class="dot" id="health-dot"></span><span id="health-text">Connecting…</span></span>
       <a class="nav-link" href="/volume">3D volume view →</a>
-      <a class="nav-link" href="/docs" target="_blank" rel="noopener">API docs ↗</a>
     </div>
   </nav>
 
@@ -918,6 +1005,9 @@ h3{font-size:.9rem;margin:1.1rem 0 .6rem}
 .stamp.rejected{border-color:var(--danger);color:var(--danger)}
 .para{font-size:.92rem;line-height:1.6;margin:.3rem 0}
 .pre{white-space:pre-wrap}
+.draftnote{background:var(--brand-soft);border:1px solid var(--border);border-radius:8px;padding:.7rem .9rem;font-size:.82rem;margin-top:.8rem}
+.ai-tag{background:var(--brand-soft);color:var(--brand);border-radius:999px;padding:.05rem .5rem;font-size:.68rem;font-weight:700;margin-left:.3rem}
+.prov{font-size:.78rem;color:var(--muted);border-left:3px solid var(--border);padding-left:.7rem;margin-top:.8rem}
 .snap{width:100%;max-width:300px;border-radius:10px;background:#05070d;display:block;margin:.8rem 0}
 .signoff{display:flex;gap:2.5rem;flex-wrap:wrap;margin-top:2rem;align-items:flex-end}
 .signoff>div{flex:1;min-width:220px}
@@ -1011,8 +1101,19 @@ footer{margin-top:1.6rem;color:var(--muted);font-size:.78rem;text-align:center;l
           <label><input type="radio" name="v-dec" value="rejected"> Findings rejected</label>
         </div>
       </div>
-      <div class="field" style="margin-top:.6rem"><label for="v-notes">Radiologist's observations / amendments <span id="v-notes-req"></span></label>
-        <textarea id="v-notes" rows="4" placeholder="e.g. Tumor margin on slices 14-16 slightly over-segmented; no midline shift seen."></textarea></div>
+      <div class="field" style="margin-top:.6rem"><label for="v-indication">Clinical indication / history (optional)</label>
+        <input type="text" id="v-indication" autocomplete="off" placeholder="e.g. headache, seizure, follow-up of known glioma"></div>
+      <div class="draftnote">The sections below were drafted by the AI from the segmentation measurements. Read them against the images,
+        <b>edit anything that is wrong or missing</b>, then sign. The final report records whether the draft was edited.</div>
+      <div class="field" style="margin-top:.6rem"><label for="v-technique">Technique <span class="ai-tag">AI draft</span></label>
+        <textarea id="v-technique" rows="3"></textarea></div>
+      <div class="field" style="margin-top:.6rem"><label for="v-findings">Findings <span class="ai-tag">AI draft</span></label>
+        <textarea id="v-findings" rows="7"></textarea></div>
+      <div class="field" style="margin-top:.6rem"><label for="v-impression">Impression <span class="ai-tag">AI draft</span></label>
+        <textarea id="v-impression" rows="3"></textarea></div>
+      <div class="field" style="margin-top:.6rem"><label for="v-notes">Additional radiologist comments <span id="v-notes-req"></span></label>
+        <textarea id="v-notes" rows="3" placeholder="e.g. Margin on slices 14-16 slightly over-segmented; no midline shift seen."></textarea></div>
+      <button type="button" class="ghost" onclick="resetDraft()" style="margin-top:.4rem">Reset text to AI draft</button>
       <div class="field" style="margin-top:.6rem"><label>Signature (draw with mouse, finger or stylus)</label>
         <canvas id="sig" width="600" height="160"></canvas>
         <button type="button" class="ghost" onclick="clearSig()">Clear signature</button></div>
@@ -1030,19 +1131,24 @@ footer{margin-top:1.6rem;color:var(--muted);font-size:.78rem;text-align:center;l
     <h2 class="rep-title">Verified Radiology Report - AI-Assisted Brain MRI Tumor Segmentation</h2>
     <div class="meta" id="f-meta"></div>
 
-    <h3>1. Findings (AI-assisted segmentation)</h3>
-    <p id="f-findings" class="para"></p>
+    <div id="f-ind-wrap"><h3>Clinical indication</h3><p class="para pre" id="f-ind"></p></div>
+
+    <h3>Technique</h3>
+    <p class="para pre" id="f-technique"></p>
+
+    <h3>Findings</h3>
+    <p class="para pre" id="f-findings"></p>
     <table class="rtable" id="f-table"></table>
     <div class="calib" id="f-calib"></div>
     <img id="f-snap" alt="3D tumor reconstruction" class="snap">
     <div class="rep-grid" id="f-reps"></div>
 
-    <h3>2. Radiologist's verified observations</h3>
-    <p class="para"><b>Decision:</b> <span id="f-dec"></span></p>
-    <p class="para pre" id="f-notes"></p>
+    <div id="f-notes-wrap"><h3>Radiologist comments</h3><p class="para pre" id="f-notes"></p></div>
 
-    <h3>3. Impression</h3>
-    <p class="para" id="f-impr"></p>
+    <h3>Impression</h3>
+    <p class="para pre" id="f-impr"></p>
+    <p class="para"><b>Radiologist's decision:</b> <span id="f-dec"></span></p>
+    <p class="prov" id="f-prov"></p>
 
     <div class="signoff">
       <div><img id="f-sig" alt="signature"><div class="vline"></div>
@@ -1076,7 +1182,7 @@ async function analyze(){
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || 'request failed');
     CURRENT_PID = pid;
-    LAST = d;
+    LAST = d; resetDraft();
     document.body.classList.remove('show-final'); document.getElementById('final').style.display = 'none';
     renderStats(d);
     renderReps(d.representative_slices);
@@ -1148,9 +1254,16 @@ function verifyReport(){
   const role = document.getElementById('v-role').value.trim();
   const dec = document.querySelector('input[name=v-dec]:checked').value;
   const notes = document.getElementById('v-notes').value.trim();
+  const indication = document.getElementById('v-indication').value.trim();
+  const txt = {technique: document.getElementById('v-technique').value.trim(),
+               findings: document.getElementById('v-findings').value.trim(),
+               impression: document.getElementById('v-impression').value.trim()};
+  const edited = ['technique','findings','impression'].some(k => txt[k] !== LAST.draft[k].trim());
   if(!name){ msg.textContent = 'Enter the name of the reviewing radiologist.'; return; }
+  if(!txt.findings || !txt.impression){ msg.textContent = 'Findings and Impression cannot be empty.'; return; }
   if(!signed){ msg.textContent = 'Please sign in the signature box.'; return; }
-  if(dec !== 'confirmed' && !notes){ msg.textContent = 'Describe the amendment / reason for rejection.'; return; }
+  if(dec === 'rejected' && !notes){ msg.textContent = 'Give the reason for rejecting the AI findings.'; return; }
+  if(dec === 'amended' && !notes && !edited){ msg.textContent = 'Edit the text above or describe the amendment in comments.'; return; }
 
   const d = LAST, s = d.stats, ex = s.extent, now = new Date();
   const when = now.toLocaleString([], {dateStyle:'medium', timeStyle:'short'});
@@ -1163,26 +1276,25 @@ function verifyReport(){
     <span>Model: <b>${esc(d.model_info.encoder)}, ${d.model_info.n_folds}-fold ensemble</b></span>
     <span>Verified: <b>${esc(when)}</b></span>`;
 
-  document.getElementById('f-findings').textContent = s.tumor_voxel_count > 0
-    ? `Automated segmentation of the ${s.total_slices}-slice MRI stack identified a tumor region on ${s.slices_with_tumor} slice(s), `
-      + `extending approximately ${ex.width_px} x ${ex.height_px} pixels in-plane over ${ex.depth_slices} slice(s) in depth, `
-      + `occupying ${s.tumor_volume_percent_of_scanned_stack}% of the scanned stack (${s.tumor_voxel_count.toLocaleString()} voxels). `
-      + `Measurements are in pixels / slice count and are not calibrated to physical units.`
-    : `Automated segmentation of the ${s.total_slices}-slice MRI stack did not identify a tumor region.`;
+  document.getElementById('f-ind').textContent = indication;
+  document.getElementById('f-ind-wrap').style.display = indication ? 'block' : 'none';
+  document.getElementById('f-technique').textContent = txt.technique;
+  document.getElementById('f-findings').textContent = txt.findings;
   document.getElementById('f-table').innerHTML = document.getElementById('r-table').innerHTML;
   document.getElementById('f-calib').textContent = d.calibration;
   document.getElementById('f-reps').innerHTML = document.getElementById('reps').innerHTML;
   snapshot3d(); document.getElementById('f-snap').src = document.getElementById('r-snap').src;
 
-  document.getElementById('f-dec').textContent = {confirmed:'The radiologist confirms the AI-assisted findings above.',
-    amended:'The radiologist confirms the findings with the amendments below.',
-    rejected:'The radiologist does not accept the AI-assisted findings.'}[dec];
-  document.getElementById('f-notes').textContent = notes || 'No additional observations recorded.';
-  document.getElementById('f-impr').textContent = {
-    confirmed: s.tumor_voxel_count > 0 ? 'AI-segmented tumor region verified by the reviewing radiologist. Clinical correlation advised.'
-                                       : 'No tumor region identified by AI segmentation; verified by the reviewing radiologist. Clinical correlation advised.',
-    amended: 'AI-segmented findings reviewed and amended by the radiologist as recorded above. Clinical correlation advised.',
-    rejected: 'AI-segmented findings were reviewed and rejected by the radiologist and must not be relied upon.'}[dec];
+  document.getElementById('f-dec').textContent = {confirmed:'AI-assisted findings confirmed.',
+    amended:'AI-assisted findings confirmed with amendments.',
+    rejected:'AI-assisted findings rejected.'}[dec];
+  document.getElementById('f-notes').textContent = notes;
+  document.getElementById('f-notes-wrap').style.display = notes ? 'block' : 'none';
+  document.getElementById('f-impr').textContent = txt.impression + (dec === 'rejected'
+    ? '\\n\\nThe reviewing radiologist rejected the AI-assisted findings; they must not be relied upon.' : '');
+  document.getElementById('f-prov').textContent =
+    'This report was drafted automatically by the TumorVision AI from segmentation measurements, then reviewed by ' + name +
+    (dec === 'rejected' ? ' and rejected.' : edited ? ' and edited by the radiologist before signing.' : ' and accepted without text edits.');
 
   document.getElementById('f-sig').src = sig.toDataURL('image/png');
   document.getElementById('f-name').textContent = name;
@@ -1193,6 +1305,19 @@ function verifyReport(){
   document.body.classList.add('show-final');
   document.getElementById('final').scrollIntoView();
 }
+function resetDraft(){
+  if(!LAST) return;
+  document.getElementById('v-technique').value = LAST.draft.technique;
+  document.getElementById('v-findings').value = LAST.draft.findings;
+  document.getElementById('v-impression').value = LAST.draft.impression;
+}
+// the saved PDF's default file name
+const BASE_TITLE = document.title;
+window.addEventListener('beforeprint', () => {
+  if(document.body.classList.contains('show-final') && LAST)
+    document.title = 'TumorVision_Report_' + LAST.patient_id + '_' + new Date().toISOString().slice(0,10);
+});
+window.addEventListener('afterprint', () => { document.title = BASE_TITLE; });
 function editReview(){
   document.body.classList.remove('show-final');
   const r = document.getElementById('report'); if(r.style.display !== 'none') r.scrollIntoView();

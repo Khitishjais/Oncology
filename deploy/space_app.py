@@ -26,18 +26,9 @@ tv.load_models()   # normally done by FastAPI's startup event, which does not fi
 demo.queue()
 demo.launch(server_name="0.0.0.0", server_port=7860, prevent_thread_lock=True, ssr_mode=False)  # SSR (Node) would swallow our routes
 
-from fastapi import APIRouter
-from fastapi.openapi.docs import get_swagger_ui_html
-
-docs = APIRouter()   # Gradio's app has /openapi.json but no Swagger page, so add one ("API docs" link in the UI)
-
-
-@docs.get("/docs", include_in_schema=False)
-def api_docs():
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="TumorVision API")
-
-
-skip = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
-ours = [r for r in tv.app.routes if getattr(r, "path", None) not in skip]
-demo.app.router.routes[0:0] = docs.routes + ours      # our routes win over Gradio's catch-alls
+# No public API docs: drop Gradio's own /docs-style routes and keep ours (tv.app has docs disabled too).
+hidden = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+ours = [r for r in tv.app.routes if getattr(r, "path", None) not in hidden]
+demo.app.router.routes[:] = [r for r in demo.app.router.routes if getattr(r, "path", None) not in hidden]
+demo.app.router.routes[0:0] = ours      # our routes win over Gradio's catch-alls
 demo.block_thread()
